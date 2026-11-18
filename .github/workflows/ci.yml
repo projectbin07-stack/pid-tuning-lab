@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ["22", "24"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dev tools
+        run: npm ci
+
+      - name: Format
+        run: npm run format:check
+
+      - name: Type check (JSDoc, strict)
+        run: npm run typecheck
+
+      - name: Test with coverage thresholds
+        run: npm run coverage
+
+      - name: CLI smoke test
+        shell: bash
+        run: |
+          node bin/pid-tuning-lab.js --version
+          node bin/pid-tuning-lab.js plants
+          node bin/pid-tuning-lab.js run --plant motor --kp 0.05 --ki 2 --kd 0
+          node bin/pid-tuning-lab.js run --plant thermal --noise default --quant default --json > run.json
+          node -e "const j = require('./run.json'); if (!(j.margins.phaseMargin > 0)) process.exit(1)"
+          node bin/pid-tuning-lab.js tune --plant fopdt --method simc
+          node bin/pid-tuning-lab.js tune --plant thermal --method zn-relay --json > tune.json
+          node bin/pid-tuning-lab.js run --plant arm --csv arm.csv
+          test "$(wc -l < arm.csv)" -eq 5002
+
+  browser:
+    name: Browser smoke test (headless Chrome)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Load the page and check the simulation ran
+        run: |
+          node scripts/serve.js &
+          sleep 1
+          # run=2000 drives 2000 motor steps of 0.1 ms before the first frame,
+          # so the live clock must read 0.200 s if every module loaded and ran;
+          # the metrics table is filled from the step-test simulation.
+          google-chrome --headless=new --disable-gpu --no-sandbox \
+            --virtual-time-budget=5000 --dump-dom \
+            "http://127.0.0.1:8000/?plant=motor&run=2000&paused=1" > dom.html
+          grep -o 'id="live-time"[^<]*' dom.html
+          grep -o 'id="m-a-overshoot"[^<]*' dom.html
+          grep -o 'id="m-a-pm"[^<]*' dom.html
+          grep -q 'id="status" class="status">ready' dom.html
+          grep -q 'id="live-time" class="time" aria-live="off">t = 0.200 s' dom.html
+          grep -q 'id="m-a-overshoot">19.1 %' dom.html

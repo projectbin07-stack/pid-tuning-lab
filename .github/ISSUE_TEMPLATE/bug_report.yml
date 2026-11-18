@@ -1,0 +1,28 @@
+name: Bug report
+description: Wrong numbers, a crash, or something that looks broken in the app
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you saw and what you expected. For a wrong number, say why you expected a different one (hand calculation, textbook value, another tool).
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The page URL with its parameters (use "Copy link"), or a CLI command line.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Output of `pid-tuning-lab --version`, or the commit hash.
+  - type: input
+    id: environment
+    attributes:
+      label: Browser or Node version, and OS

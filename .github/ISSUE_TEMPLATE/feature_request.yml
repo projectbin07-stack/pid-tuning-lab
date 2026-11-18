@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest a plant model, a tuning rule, a metric or a change
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What would you like to try or show that is hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Reference to the method, textbook section or paper if there is one.
+  - type: textarea
+    id: verification
+    attributes:
+      label: How could it be tested?
+      description: Everything here is simulated, so a change should come with a test against a value that can be worked out by hand (an analytic response, a textbook margin, a known ultimate gain).

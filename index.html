@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PID Tuning Lab</title>
+    <meta
+      name="description"
+      content="Design and tune discrete PID controllers on simulated plants: live strip charts, step-response metrics, Bode and Nyquist plots, autotuning."
+    />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="styles.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M1 13h3l2-9 3 7 2-3h4' fill='none' stroke='%232563eb' stroke-width='2'/%3E%3C/svg%3E"
+    />
+    <script type="module" src="src/ui/app.js"></script>
+  </head>
+  <body>
+    <header class="top">
+      <div>
+        <h1>PID Tuning Lab</h1>
+        <p class="tagline">
+          Design and tune a discrete PID controller on simulated plants. Every plant is a model with
+          illustrative parameters, not a measurement of real hardware.
+        </p>
+      </div>
+      <nav>
+        <a href="https://github.com/projectbin07-stack/pid-tuning-lab">Source and docs</a>
+        <button type="button" id="btn-link" title="Copy a link to this exact setup">
+          Copy link
+        </button>
+      </nav>
+    </header>
+
+    <main class="layout">
+      <section class="panel controls" aria-label="Plant and controller settings">
+        <fieldset>
+          <legend>Plant</legend>
+          <label class="row"
+            ><span>Model</span>
+            <select id="plant"></select>
+          </label>
+          <canvas
+            id="schematic"
+            class="schematic"
+            role="img"
+            aria-label="Schematic of the selected plant"
+          ></canvas>
+          <p id="plant-summary" class="note"></p>
+          <details>
+            <summary>Equations and parameters</summary>
+            <pre id="equations"></pre>
+            <div id="params" class="grid2"></div>
+          </details>
+        </fieldset>
+
+        <fieldset>
+          <legend>Controller <span class="tag tag-a">A</span></legend>
+          <div class="row radios" role="radiogroup" aria-label="Gain form">
+            <label><input type="radio" name="form" value="parallel" checked /> parallel</label>
+            <label><input type="radio" name="form" value="ideal" /> ideal (Kc, Ti, Td)</label>
+          </div>
+          <div id="gains"></div>
+          <details>
+            <summary>Filter, weights, limits, anti-windup</summary>
+            <div class="grid2">
+              <label>Derivative filter N <input id="n" type="number" step="any" min="0" /></label>
+              <label>Sample time Ts (s) <input id="ts" type="number" step="any" min="0" /></label>
+              <label>Setpoint weight b <input id="b" type="number" step="0.1" /></label>
+              <label>Setpoint weight c <input id="c" type="number" step="0.1" /></label>
+              <label>Output min <input id="umin" type="number" step="any" /></label>
+              <label>Output max <input id="umax" type="number" step="any" /></label>
+              <label
+                >Anti-windup
+                <select id="aw">
+                  <option value="backcalc">back-calculation</option>
+                  <option value="clamp">clamping</option>
+                  <option value="none">none</option>
+                </select>
+              </label>
+              <label
+                >Tracking time Tt (s, 0 = auto) <input id="tt" type="number" step="any" min="0"
+              /></label>
+              <label
+                >Rate limit (/s, 0 = off) <input id="rate" type="number" step="any" min="0"
+              /></label>
+              <label
+                >Feed-forward 0..1 <input id="ff" type="number" step="0.1" min="0" max="1"
+              /></label>
+            </div>
+          </details>
+        </fieldset>
+
+        <fieldset>
+          <legend>Autotune</legend>
+          <div class="row">
+            <select id="tune-method" aria-label="Tuning method">
+              <option value="simc">SIMC (step test, PI)</option>
+              <option value="cohen-coon">Cohen-Coon (step test)</option>
+              <option value="zn-step">Ziegler-Nichols step</option>
+              <option value="zn-relay">Ziegler-Nichols relay</option>
+              <option value="tyreus-luyben">Tyreus-Luyben relay</option>
+            </select>
+            <select id="tune-type" aria-label="Controller type">
+              <option value="pid">PID</option>
+              <option value="pi">PI</option>
+              <option value="p">P</option>
+            </select>
+            <button type="button" id="btn-tune">Tune</button>
+          </div>
+          <div id="tune-result" class="note" aria-live="polite"></div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Sensor and scenario</legend>
+          <div class="grid2">
+            <label class="check"
+              ><input id="noise-on" type="checkbox" /> Noise, std
+              <input id="noise" type="number" step="any" min="0"
+            /></label>
+            <label class="check"
+              ><input id="quant-on" type="checkbox" /> Quantisation
+              <input id="quant" type="number" step="any" min="0"
+            /></label>
+            <label>Sensor lag (s) <input id="lag" type="number" step="any" min="0" /></label>
+            <label>Noise seed <input id="seed" type="number" step="1" /></label>
+            <label>Setpoint after step <input id="sp" type="number" step="any" /></label>
+            <label>Load disturbance <input id="dist" type="number" step="any" /></label>
+          </div>
+          <p id="quant-note" class="note"></p>
+        </fieldset>
+      </section>
+
+      <div class="col-mid">
+        <section class="panel live" aria-label="Live simulation">
+          <div class="toolbar" role="toolbar" aria-label="Simulation controls">
+            <button type="button" id="btn-run" aria-keyshortcuts="Space">Pause</button>
+            <button type="button" id="btn-reset" aria-keyshortcuts="R">Reset</button>
+            <button type="button" id="btn-step" aria-keyshortcuts="S">Setpoint step</button>
+            <button type="button" id="btn-dist" aria-keyshortcuts="D" aria-pressed="false">
+              Disturbance
+            </button>
+            <button type="button" id="btn-noise" aria-keyshortcuts="N" aria-pressed="false">
+              Noise
+            </button>
+            <button type="button" id="btn-manual" aria-keyshortcuts="M" aria-pressed="false">
+              Manual
+            </button>
+            <label class="manual"
+              >u<sub>man</sub>
+              <input id="manual-u" type="range" min="0" max="1000" value="500" disabled
+            /></label>
+            <label
+              >Speed
+              <select id="speed">
+                <option value="0.25">x0.25</option>
+                <option value="0.5">x0.5</option>
+                <option value="1" selected>x1</option>
+                <option value="2">x2</option>
+                <option value="4">x4</option>
+              </select>
+            </label>
+          </div>
+          <div class="toolbar compare" role="toolbar" aria-label="Compare">
+            <button type="button" id="btn-pin" aria-keyshortcuts="P">Pin as B</button>
+            <button type="button" id="btn-clear-b" disabled>Clear B</button>
+            <span class="legend">
+              <span class="key key-set"></span>setpoint <span class="key key-a"></span>A (editing)
+              <span class="key key-b"></span>B (pinned)
+            </span>
+            <span id="live-time" class="time" aria-live="off">t = 0.00 s</span>
+          </div>
+          <canvas id="c-y" class="strip" role="img" aria-label="Live output and setpoint"></canvas>
+          <canvas id="c-u" class="strip" role="img" aria-label="Live control signal"></canvas>
+          <canvas id="c-e" class="strip short" role="img" aria-label="Live error"></canvas>
+        </section>
+        <section class="panel freq-panel" aria-label="Loop frequency response">
+          <h2>Loop frequency response</h2>
+          <p id="margin-note" class="note"></p>
+          <div class="freq">
+            <canvas id="c-bode" class="bode" role="img" aria-label="Bode plot of the loop"></canvas>
+            <canvas
+              id="c-nyq"
+              class="nyq"
+              role="img"
+              aria-label="Nyquist plot of the loop"
+            ></canvas>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel analysis" aria-label="Step test and metrics">
+        <h2>Step test</h2>
+        <p id="scenario-note" class="note"></p>
+        <canvas id="c-step-y" class="strip" role="img" aria-label="Step test output"></canvas>
+        <canvas
+          id="c-step-u"
+          class="strip short"
+          role="img"
+          aria-label="Step test control signal"
+        ></canvas>
+        <table id="metrics" class="metrics">
+          <caption class="visually-hidden">
+            Performance metrics of controllers A and B
+          </caption>
+          <thead>
+            <tr>
+              <th scope="col">Metric</th>
+              <th scope="col"><span class="tag tag-a">A</span></th>
+              <th scope="col" class="col-b"><span class="tag tag-b">B</span></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        Keyboard: <kbd>Space</kbd> pause, <kbd>R</kbd> reset, <kbd>S</kbd> setpoint step,
+        <kbd>D</kbd> disturbance, <kbd>N</kbd> noise, <kbd>M</kbd> manual/auto, <kbd>P</kbd> pin as
+        B.
+      </p>
+      <p>
+        All plants are simulated models with illustrative parameters. Margins come from the linear
+        (or linearised) model and a continuous approximation of the sampled loop.
+        <span id="status" class="status">loading</span>
+      </p>
+    </footer>
+  </body>
+</html>

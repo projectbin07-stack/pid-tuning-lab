@@ -691,8 +691,9 @@ button("btn-tune").addEventListener("click", () => {
   const method = select("tune-method").value;
   const typeRaw = select("tune-type").value;
   const type = typeRaw === "pi" || typeRaw === "p" ? typeRaw : "pid";
+  const kuEstimate = select("tune-ku").value === "harmonic" ? "harmonic" : "describing-function";
   try {
-    const res = autotune(A, method, type);
+    const res = autotune(A, method, type, { kuEstimate });
     A = { ...res.settings, form: A.form };
     const lines = [];
     if (res.model) {
@@ -701,14 +702,24 @@ button("btn-tune").addEventListener("click", () => {
       );
     }
     if (res.relay) {
+      const v = res.relay.validity;
+      const shift = Number.isFinite(v.delaySensitivity)
+        ? `${(100 * v.delaySensitivity).toFixed(1)} %`
+        : "stops the oscillation";
       lines.push(
-        `Relay test: Ku ${formatValue(res.relay.ku)}, Pu ${formatValue(res.relay.pu, "s")}.`,
+        `Relay test: Ku ${formatValue(res.relay.ku)} (${res.relay.kuEstimate === "harmonic" ? "first harmonic" : "describing function"}), Pu ${formatValue(res.relay.pu, "s")}.`,
+        `Validity check ${v.valid ? "passed" : "FAILED"}: ${formatValue(v.samplesPerPeriod)} samples per period; one extra sample of delay changes Pu by ${shift}.`,
       );
     }
     lines.push(
       `${method} ${res.type.toUpperCase()}: Kp ${formatValue(res.gains.kp)}, Ki ${formatValue(res.gains.ki)}, Kd ${formatValue(res.gains.kd)}.`,
     );
     out.textContent = lines.join(" ");
+    for (const n of res.notes) {
+      const p = document.createElement("p");
+      p.textContent = n;
+      out.append(p);
+    }
     for (const w of res.warnings) {
       const p = document.createElement("p");
       p.className = "warn";

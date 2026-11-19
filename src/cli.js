@@ -25,17 +25,24 @@ const HELP = `pid-tuning-lab ${VERSION}: discrete PID design on simulated plants
 Usage:
   pid-tuning-lab plants
   pid-tuning-lab run  --plant <id> [controller, sensor and scenario options]
-  pid-tuning-lab tune --plant <id> --method <method> [--type pid|pi|p] [options]
+  pid-tuning-lab tune --plant <id> --method <method> [--type pid|pi|p] [--ku df|harmonic] [options]
   pid-tuning-lab --help | --version
 
 run simulates a setpoint step followed by a load disturbance and prints
 time-domain metrics and, from the linear(ised) model, stability margins.
 tune runs the experiment the method needs on the simulated plant (an
 open-loop step or a relay test), applies the tuning rule and evaluates
-the result.
+the result. Relay results are checked for validity (is the oscillation
+set by the plant or by the controller's sampling?) and a warning explains
+a failed check.
 
 Plants: ${PLANTS.map((p) => p.id).join(", ")}
 Methods: ${TUNING_METHODS.join(", ")}
+
+Tuning:
+  --type pid|pi|p          controller type for the rule (default pid; simc is PI)
+  --ku df|harmonic         relay methods: Ku from the describing function
+                           (default) or from the first Fourier harmonic
 
 Controller (defaults depend on the plant):
   --kp, --ki, --kd <x>     parallel-form gains
@@ -81,6 +88,7 @@ const OPTIONS = /** @type {const} */ ({
   plant: { type: "string" },
   method: { type: "string" },
   type: { type: "string" },
+  ku: { type: "string" },
   form: { type: "string" },
   kp: { type: "string" },
   ki: { type: "string" },
@@ -366,7 +374,12 @@ export function main(argv, io) {
       const type = values.type ?? "pid";
       if (type !== "pid" && type !== "pi" && type !== "p")
         throw new UsageError("--type must be pid, pi or p");
-      const res = autotune(settings, values.method, type);
+      const kuOption = values.ku ?? "df";
+      if (kuOption !== "df" && kuOption !== "harmonic")
+        throw new UsageError("--ku must be df or harmonic");
+      const res = autotune(settings, values.method, type, {
+        kuEstimate: kuOption === "harmonic" ? "harmonic" : "describing-function",
+      });
       const e = evaluate(res.settings);
       if (values.json) {
         io.out(
@@ -379,6 +392,7 @@ export function main(argv, io) {
             relay: res.relay,
             gains: res.gains,
             warnings: res.warnings,
+            notes: res.notes,
             ...summary(e),
           }) + "\n",
         );
@@ -393,10 +407,19 @@ export function main(argv, io) {
           );
         }
         if (res.relay) {
+          const r = res.relay;
+          const v = r.validity;
+          const used = r.kuEstimate === "harmonic" ? "first harmonic" : "describing function";
+          const shift = Number.isFinite(v.delaySensitivity)
+            ? `${(100 * v.delaySensitivity).toFixed(1)} %`
+            : "stopped the oscillation";
           lines.push(
-            `relay test   Ku ${fmt(res.relay.ku)}, Pu ${fmt(res.relay.pu)} s (output amplitude ${fmt(res.relay.amplitude)})`,
+            `relay test   Ku ${fmt(r.ku)}, Pu ${fmt(r.pu)} s (output amplitude ${fmt(r.amplitude)})`,
+            `             Ku by describing function ${fmt(r.kuDescribingFunction)}, by first harmonic ${fmt(r.kuHarmonic)}; the rule uses the ${used}`,
+            `validity     ${v.valid ? "passed" : "FAILED"}: ${fmt(v.samplesPerPeriod)} samples per period, one extra sample of delay changes Pu by ${shift}`,
           );
         }
+        for (const n of res.notes) lines.push(`note         ${n}`);
         for (const w of res.warnings) lines.push(`warning      ${w}`);
         io.out(lines.join("\n") + "\n" + formatEvaluation(res.settings, e));
       }

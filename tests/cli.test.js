@@ -101,6 +101,12 @@ test("tune --json reports the model, the gains and the evaluation", () => {
   assert.equal(relay.type, "pi");
   assert.equal(relay.model, null);
   assert.ok(relay.relay.ku > 0 && relay.relay.pu > 0);
+  assert.equal(relay.relay.kuEstimate, "describing-function");
+  assert.equal(relay.relay.ku, relay.relay.kuDescribingFunction);
+  assert.equal(relay.relay.validity.valid, true);
+  assert.deepEqual(relay.relay.validity.failures, []);
+  assert.deepEqual(relay.warnings, []);
+  assert.deepEqual(relay.notes, []);
   assert.equal(relay.gains.kd, 0);
 });
 
@@ -114,7 +120,19 @@ test("text output of run and tune", () => {
   assert.match(t.out, /two-point/);
   const w = run(["tune", "--plant", "motor", "--method", "zn-relay"]);
   assert.match(w.out, /relay test {3}Ku /);
-  assert.match(w.out, /warning {6}The relay oscillation period/);
+  assert.match(w.out, /validity {5}FAILED: 4 samples per period/);
+  assert.match(w.out, /warning {6}The relay test failed its validity check/);
+  assert.match(w.out, /Use a step-test method \(SIMC or Cohen-Coon\)/);
+  const integ = run(["tune", "--plant", "integrating", "--method", "tyreus-luyben"]);
+  assert.match(integ.out, /Tyreus-Luyben gains/);
+  assert.match(integ.out, /need a self-regulating plant and do not apply here/);
+  const ok = run(["tune", "--plant", "fopdt", "--method", "zn-relay"]);
+  assert.match(ok.out, /validity {5}passed: 76 samples per period/);
+  assert.match(ok.out, /note {9}The describing-function Ku \(3\.388\) is 19 % below/);
+  assert.doesNotMatch(ok.out, /warning/);
+  const h = run(["tune", "--plant", "fopdt", "--method", "zn-relay", "--ku", "harmonic"]);
+  assert.match(h.out, /relay test {3}Ku 4\.164,/);
+  assert.match(h.out, /the rule uses the first harmonic/);
   const arm = run(["run", "--plant", "arm", "--rate", "50", "--ff", "1", "--disturbance", "0"]);
   assert.match(arm.out, /rate limit 50\/s, feed-forward 1/);
   assert.match(arm.out, /linearised about y = 1\.57/);
@@ -184,6 +202,7 @@ test("usage errors exit with code 2, model errors with code 1", () => {
     [["tune", "--plant", "fopdt"], /needs --method/],
     [["tune", "--method", "best"], /--method must be/],
     [["tune", "--method", "simc", "--type", "pd"], /--type/],
+    [["tune", "--method", "zn-relay", "--ku", "exact"], /--ku must be df or harmonic/],
     [["fly"], /unknown command/],
     [["run", "extra"], /unexpected argument/],
     [["run", "--bogus"], /Unknown option/],

@@ -278,27 +278,128 @@ Pu = mean period,   Ku = 4 d / (pi sqrt(a^2 - eps^2))
 
 where `a` is the measured output amplitude and `eps` the relay hysteresis
 (set to `3 * noise std + quantisation step` in the app so that noise does
-not cause chattering).
+not cause chattering). This `Ku` is the describing-function estimate and is
+what the rules use by default.
 
-Weaknesses, all visible in the lab:
+The experiment also computes a **first-harmonic estimate**. Over the same
+whole periods it takes the first Fourier component of the measured output,
+`Y1`, and of the relay output, `U1`. In a periodic steady state a linear
+plant maps each harmonic of its input to the same harmonic of its output
+through its frequency response, so `Y1 / U1 = G(j w_osc)` exactly, with
+`w_osc = 2 pi / Pu`, whatever the waveform. Then
+`Ku_harmonic = 1 / |Y1 / U1|`. This removes the describing function's
+assumption that the output is a sinusoid. It is still the gain at the
+oscillation frequency, which can differ from the true ultimate frequency
+(see below). CLI `--ku harmonic` and the app's "Ku: first harmonic" option
+make the rules use it. When the two estimates differ by more than 5 %, the
+result carries a note that gives both values.
 
-- `Ku` comes from the describing-function approximation, which assumes the
-  plant filters the relay's square wave to a near-sinusoid. On the test plant
-  `1/(s+1)^3` the estimate is 7.78 against the true 8, 2.7 % low (the test
-  allows 6 %); on the default thermal
-  model 2 % low (Ku 0.315 vs 0.322 from the frequency response); on the
-  default FOPDT plant, whose output is closer to a triangle wave, 18 % low
-  (3.39 vs 4.16).
-- With hysteresis the oscillation settles where the loop phase is
-  `-180 deg + asin(eps/a)`, not at the ultimate point (tested), so the
-  formula gives `1/|G|` at a slightly lower frequency.
-- Plants with at most two lags and no dead time (motor, mass-spring-damper,
-  integrating, arm) never reach -180 deg on their own; the oscillation that
-  appears is caused by the sampling delay, and its period can be a few
-  controller samples. The app warns when `Pu < 10 Ts`; ZN gains from such a
-  test are usually far too aggressive.
-- The arm is nonlinear, so the relay limit cycle may not settle to a
-  constant period; a warning is shown when it has not.
+#### Is the relay result meaningful? (validity test)
+
+A relay oscillates wherever the _loop_ phase reaches -180 deg, and the loop
+includes the controller: sampling and the zero-order hold add roughly one
+sample time `T` of delay (`T/2` from the hold, Astrom and Wittenmark 1997,
+plus up to one sample before the relay sees a sign change). If the plant
+alone never reaches -180 deg, the oscillation exists only because of that
+delay. `Pu` and `Ku` then describe the controller's timing, not the plant.
+Ziegler-Nichols or Tyreus-Luyben gains computed from them change with the
+sample time and are usually too aggressive. Low-order plants without dead
+time are like this (at most two lags, or an integrator and one lag): the
+motor, the mass-spring-damper, the integrating axis and the arm. Their
+phase approaches -180 deg only as the frequency goes to infinity.
+
+`relayValidity` (`src/core/tuning.js`) checks any relay experiment with
+measured data only, so the same procedure would work on a real bench:
+
+1. **Delay sensitivity.** The experiment is repeated with the relay acting
+   on the measurement one controller sample older (a known extra delay
+   `T`). Near the oscillation frequency, extra delay `T` shifts the
+   frequency by about `dw / w = -T / D`, where `D = -d(arg L)/dw` is the
+   loop's phase slope there (its group delay). If the plant sets the cycle,
+   `D` is dominated by the plant (for example about `theta + tau/(1 + w^2 tau^2)`
+   for an FOPDT) and the period barely moves. If the loop delay sets it,
+   `D` is of the order of `T` and the period grows by a large fraction. The
+   relative change `(Pu' - Pu) / Pu` is therefore an estimate of the share of
+   the loop's phase slope that one sample accounts for. The test requires it
+   to be at most **25 %**. This threshold is a judgement call. On the
+   built-in plants the values are bimodal (table below): at most 7 % where
+   the plant has its own -180 deg crossing, and at least 80 % where it does
+   not.
+2. **Samples per period.** `Pu >= 10 T`. With fewer samples the period is
+   resolved to worse than 10 % (so criterion 1 cannot resolve 25 % reliably),
+   and the ZN derivative time `Pu/8` is about one sample.
+3. **A steady, symmetric cycle.** The last four periods agree within 0.5 %,
+   the per-cycle amplitude varies by at most 5 %, and the relay spends nearly
+   equal time high and low (`|2 t_high / P - 1| <= 10 %`). If not, `Pu` and
+   `a` are not well defined. Typical causes are a nonlinear plant (the arm)
+   or a load or bias that the relay is not centred on.
+
+If any criterion fails, the CLI prints `validity FAILED` and a warning, and
+the app shows the warning under the tuning result. The warning names the
+failed criteria, says the gains are not trustworthy and suggests SIMC or
+Cohen-Coon from a step test. For a plant that is not self-regulating it
+says instead that the step-test methods do not apply. The gains are still
+computed and applied, so they can be inspected.
+
+Values at the default settings (CLI `tune --method zn-relay`):
+
+| Plant         | `T`     | `Pu`     | samples / period | `dPu/Pu` with +1 sample | Result                                                     |
+| ------------- | ------- | -------- | ---------------- | ----------------------- | ---------------------------------------------------------- |
+| `fopdt`       | 0.05 s  | 3.8 s    | 76               | 5.3 %                   | passes                                                     |
+| `thermal`     | 0.1 s   | 11.6 s   | 116              | 6.9 %                   | passes                                                     |
+| `motor`       | 1 ms    | 4 ms     | 4                | 100 %                   | fails (delay sensitivity, samples per period)              |
+| `msd`         | 0.01 s  | 0.48 s   | 48               | 87.5 %                  | fails (delay sensitivity)                                  |
+| `integrating` | 0.01 s  | 0.2 s    | 20               | 80 %                    | fails (delay sensitivity)                                  |
+| `arm`         | 0.005 s | 0.3275 s | 65.5             | 85.5 %                  | fails (delay sensitivity, period and amplitude not steady) |
+
+The plant models confirm the split. The FOPDT model reaches -180 deg
+through its dead time and the hotend through its three lags, at a finite
+frequency. The other four never do on their own. The result moves with the
+sample time as expected (tested). On the FOPDT plant the delay sensitivity
+rises from 3.2 % at `T = 0.03 s` through 5.3 % (0.05 s) to 20 % (0.2 s), and
+the test fails at 0.3 s, where one sample is 30 % of the dead time. On the
+motor, `Pu` is 4 samples at every sample time from 0.5 ms to 4 ms and 8
+samples at 0.2 ms. It is set by `T`, and none of these sample times makes
+the test pass. The mass-spring-damper also still fails with a controller
+five times faster (65 %).
+
+#### Accuracy of Ku when the test passes
+
+- **Describing-function error.** The describing function treats the relay
+  as if its input were a sinusoid of amplitude `a`. When the plant does not
+  filter the square wave well, the output is not a sinusoid and `Ku` is
+  biased. For an FOPDT plant and an ideal continuous relay the limit cycle
+  can be solved exactly. The output dips for `theta` after each switch and
+  then relaxes exponentially, which gives
+  `a = K d (1 - e^(-theta/tau))` and `Pu = 2 theta + 2 tau ln(2 - e^(-theta/tau))`
+  (derivation: integrate the first-order response over the dead time and
+  the following half period; see Yu 2006 for this exact relay analysis).
+  With the defaults (K = 2, tau = 5 s, theta = 1 s) the describing function
+  gives `Ku = 4 / (pi K (1 - e^-0.2)) = 3.51` and `Pu = 3.67 s`. The model's
+  true ultimate point is `Ku = 4.25`, `Pu = 3.72 s`, so the estimate is 17 %
+  low from the approximation alone. Because `theta/tau` is small, the output
+  is close to a triangle wave, whose fundamental is `8/pi^2 = 0.81` times its
+  peak. That is where most of the error comes from. The simulation
+  reproduces both formulas within 1 % with a 10 ms controller (tested).
+- **Sampling.** At the default `T = 0.05 s` the hold adds about `T/2` of
+  delay. With that delay the loop's own ultimate point is `Ku = 4.16`,
+  `Pu = 3.81 s`. The relay measures `Pu = 3.8 s` and describing-function
+  `Ku = 3.39`, 18.5 % low. The first-harmonic estimate is 4.16, which
+  matches to within 0.2 %.
+- **Hysteresis.** With hysteresis the oscillation settles where the loop
+  phase is `-180 deg + asin(eps/a)`, not at the ultimate point (tested).
+  `4 d / (pi sqrt(a^2 - eps^2))` is then `1/|G|` at that slightly lower
+  frequency, and so is the first-harmonic estimate.
+- **Other plants.** On `1/(s+1)^3` (2 ms sample time) the describing
+  function gives 7.78 and the first harmonic 7.76, both about 3 % below the
+  true 8. The oscillation period is 3.68 s rather than 3.63 s, so both
+  values are `1/|G|` at a slightly lower frequency (`1/|G|` = 7.75 there).
+  On the default hotend the two estimates are 0.315 and 0.313, against 0.322
+  at the model's ultimate frequency (Pu 11.4 s versus the measured 11.6 s).
+
+Nothing in the lab corrects for the period error. The describing-function
+value stays the default, so v0.1.0 results do not change. The note in the
+output gives the expected size of the error for the experiment at hand.
 
 ## References
 
@@ -315,3 +416,9 @@ Weaknesses, all visible in the lab:
   processes", _Ind. Eng. Chem. Res._ 31, 1992.
 - C. L. Smith, _Digital Computer Process Control_, Intext, 1972 (two-point
   FOPDT method).
+- K. J. Astrom, B. Wittenmark, _Computer-Controlled Systems: Theory and
+  Design_, 3rd ed., Prentice Hall, 1997 (zero-order hold as a half-sample
+  delay; choice of sample time).
+- C.-C. Yu, _Autotuning of PID Controllers: A Relay Feedback Approach_,
+  2nd ed., Springer, 2006 (exact relay oscillation of FOPDT processes and
+  the accuracy of the describing-function estimate).

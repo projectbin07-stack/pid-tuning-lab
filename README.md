@@ -49,7 +49,10 @@ reproducible numbers.
 - **Tuning**: open-loop step test with two-point and least-squares FOPDT
   identification, then SIMC, Cohen-Coon or Ziegler-Nichols reaction-curve
   rules; Astrom-Hagglund relay autotune with Ziegler-Nichols or
-  Tyreus-Luyben rules. Warnings when an experiment does not fit the rule's
+  Tyreus-Luyben rules. Every relay test goes through a general validity
+  check: is the oscillation set by the plant or by the controller's sampling
+  delay? Ku is given both from the describing function and from the first
+  Fourier harmonic. Warnings when an experiment does not fit the rule's
   assumptions.
 - **Metrics**: rise time, settling time, overshoot, steady-state error,
   IAE/ISE/ITAE, control effort, total variation of u, saturation time,
@@ -75,8 +78,10 @@ disturbance. Try:
    to back-calculation, and compare.
 2. On the **DC motor**, tick **Noise** and add some Kd, then lower the
    derivative filter N to see how much of the noise reaches the voltage.
-3. Run **Autotune** with "Ziegler-Nichols relay" on the motor and read the
-   warning, then try it on the thermal plant where a relay test is meaningful.
+3. Run **Autotune** with "Ziegler-Nichols relay" on the motor (or the
+   mass-spring-damper, integrating axis or arm) and read why the validity
+   check fails. Then try it on the thermal or FOPDT plant, where a relay test
+   is meaningful, and compare the two Ku estimates.
 
 The thermal example as a link:
 [`?plant=thermal&aw=none&compare=1&run=6000&paused=1`](https://projectbin07-stack.github.io/pid-tuning-lab/?plant=thermal&aw=none&compare=1&run=6000&paused=1)
@@ -172,23 +177,46 @@ stability margins (exact linear model)
 
 A relay test on the hotend (first lines; the evaluation follows as above).
 The ultimate point of this model computed from its frequency response is
-Ku = 0.322, Pu = 11.4 s, so the relay estimate is 2 % low:
+Ku = 0.322, Pu = 11.4 s, so the relay estimate is 2 % low. The validity
+check passes: one extra sample of delay in the loop moves the period by only
+6.9 %, so the plant sets the oscillation, not the controller's timing:
 
 ```
 $ node bin/pid-tuning-lab.js tune --plant thermal --method zn-relay
 method       zn-relay (PID)
 relay test   Ku 0.3151, Pu 11.6 s (output amplitude 0.8081)
+             Ku by describing function 0.3151, by first harmonic 0.3127; the rule uses the describing function
+validity     passed: 116 samples per period, one extra sample of delay changes Pu by 6.9 %
 plant        Thermal (hotend) (thermal)
 controller   Kp 0.1891  Ki 0.0326  Kd 0.2742   (ideal: Kc 0.1891, Ti 5.8 s, Td 1.45 s)
 ```
 
-And the same test where it does not work, on the motor:
+The same test where it does not work. On the mass-spring-damper (and the
+motor, integrating axis and arm) the plant alone never reaches -180 deg of
+phase, so the oscillation comes from the sampling delay:
 
 ```
-$ node bin/pid-tuning-lab.js tune --plant motor --method zn-relay
+$ node bin/pid-tuning-lab.js tune --plant msd --method zn-relay
 method       zn-relay (PID)
-relay test   Ku 4.882, Pu 0.004 s (output amplitude 1.252)
-warning      The relay oscillation period (0.00400 s) is under 10 controller samples. The plant has too little phase lag for a relay test, so the oscillation is set by the sampling delay and the gains derived from it are likely to be too aggressive.
+relay test   Ku 162.8, Pu 0.48 s (output amplitude 0.06255)
+             Ku by describing function 162.8, by first harmonic 166.3; the rule uses the describing function
+validity     FAILED: 48 samples per period, one extra sample of delay changes Pu by 87.5 %
+warning      The relay test failed its validity check: one extra sample of loop delay changed the period by 87.5 % (at most 25.0 % allowed). The oscillation is set by the controller's sampling and loop delay rather than by the plant's own phase lag, so Ku, Pu and the Ziegler-Nichols gains derived from them are not trustworthy: they follow the sample time, not the plant, and are usually too aggressive. Use a step-test method (SIMC or Cohen-Coon) instead; it warns separately if the FOPDT fit is poor.
+```
+
+On the default FOPDT plant the test is valid, but the relay output is
+nearly a triangle wave and the describing-function Ku is 19 % low. The
+output says so. `--ku harmonic` uses the first-harmonic estimate instead,
+which matches the sampled loop's ultimate gain (4.16) to within 0.2 %:
+
+```
+$ node bin/pid-tuning-lab.js tune --plant fopdt --method zn-relay --ku harmonic
+method       zn-relay (PID)
+relay test   Ku 4.164, Pu 3.8 s (output amplitude 0.3006)
+             Ku by describing function 3.388, by first harmonic 4.164; the rule uses the first harmonic
+validity     passed: 76 samples per period, one extra sample of delay changes Pu by 5.3 %
+note         The describing-function Ku (3.388) is 19 % below the first-harmonic estimate (4.164). The relay output here is far from sinusoidal, which the describing function assumes, so expect the classic Ku to be off by about that much; the first-harmonic estimate measures the plant's gain at the oscillation frequency without that assumption. The gains use the first-harmonic estimate.
+plant        First order + dead time (fopdt)
 ```
 
 `--json` prints the settings, scenario, metrics and margins as JSON (non-finite
@@ -197,22 +225,29 @@ The output is deterministic for a given seed. Full usage:
 
 ```
 $ node bin/pid-tuning-lab.js --help
-pid-tuning-lab 0.1.0: discrete PID design on simulated plants
+pid-tuning-lab 0.1.1: discrete PID design on simulated plants
 
 Usage:
   pid-tuning-lab plants
   pid-tuning-lab run  --plant <id> [controller, sensor and scenario options]
-  pid-tuning-lab tune --plant <id> --method <method> [--type pid|pi|p] [options]
+  pid-tuning-lab tune --plant <id> --method <method> [--type pid|pi|p] [--ku df|harmonic] [options]
   pid-tuning-lab --help | --version
 
 run simulates a setpoint step followed by a load disturbance and prints
 time-domain metrics and, from the linear(ised) model, stability margins.
 tune runs the experiment the method needs on the simulated plant (an
 open-loop step or a relay test), applies the tuning rule and evaluates
-the result.
+the result. Relay results are checked for validity (is the oscillation
+set by the plant or by the controller's sampling?) and a warning explains
+a failed check.
 
 Plants: fopdt, msd, motor, integrating, thermal, arm
 Methods: simc, cohen-coon, zn-step, zn-relay, tyreus-luyben
+
+Tuning:
+  --type pid|pi|p          controller type for the rule (default pid; simc is PI)
+  --ku df|harmonic         relay methods: Ku from the describing function
+                           (default) or from the first Fourier harmonic
 
 Controller (defaults depend on the plant):
   --kp, --ki, --kd <x>     parallel-form gains
@@ -287,14 +322,26 @@ frequency.
   of amplitude d around the operating point; the limit cycle gives
   `Pu` and `Ku = 4 d / (pi a)`. Then **Ziegler-Nichols**
   (`0.6 Ku, Pu/2, Pu/8`) or the more conservative **Tyreus-Luyben**
-  (`Ku/2.2, 2.2 Pu, Pu/6.3`).
+  (`Ku/2.2, 2.2 Pu, Pu/6.3`). Optionally, `Ku = 1/|Y1/U1|` from the
+  first Fourier components of the output and relay signals (`--ku harmonic`),
+  which does not assume a sinusoidal output.
+- **Relay validity check**, run for every relay test on any plant. The test
+  is repeated with one extra controller sample of delay. If the period
+  changes by more than 25 %, the loop delay rather than the plant sets the
+  oscillation. The check also requires at least 10 samples per period and a
+  steady, symmetric cycle. A failed check prints a warning that says why the
+  gains cannot be trusted and suggests SIMC or Cohen-Coon from a step test.
+  At the default settings it passes on `fopdt` and `thermal` and fails on
+  `motor`, `msd`, `integrating` and `arm`.
 
-Known weaknesses, which the lab shows rather than hides: the describing
-function makes `Ku` approximate (2 % low on the hotend model, 18 % low on
-the default FOPDT plant whose relay response is nearly triangular); a relay
-on a plant with at most two lags and no dead time oscillates at a period set
-by the sampling, so ZN gains from it are unusable; FOPDT fits of oscillatory
-or nonlinear plants are poor. Details in [docs/models.md](docs/models.md).
+Known weaknesses, which the lab shows rather than hides. The describing
+function makes `Ku` approximate: 2 % low on the hotend model, and 18 % low
+on the default FOPDT plant, whose relay response is nearly triangular. The
+output then carries a note with both estimates. A relay on a plant with at
+most two lags and no dead time oscillates at a period set by the sampling,
+so ZN gains from it are unusable; the validity check flags this. FOPDT fits
+of oscillatory or nonlinear plants are poor. Details, derivations and
+references are in [docs/models.md](docs/models.md).
 
 ## Architecture
 
@@ -356,7 +403,16 @@ The tests check behaviour against values derived independently of the code:
   step the output.
 - Relay autotune on `1/(s+1)^3` recovers Ku = 8 within 6 % and
   Pu = 2 pi / sqrt 3 within 2 %; with hysteresis it lands where the
-  describing function predicts.
+  describing function predicts. The first-harmonic Ku equals `1/|G|` at the
+  oscillation frequency within 0.5 %. On an FOPDT plant with a fast
+  controller, the describing-function Ku and the period match the exact
+  relay-oscillation formulas within 1 %.
+- The relay validity check passes on the hotend and FOPDT plants and fails
+  on the motor, mass-spring-damper, integrating axis and arm at the default
+  settings. The FOPDT delay sensitivity grows with the sample time until
+  the check fails. The motor's period scales with the sample time, and the
+  check never passes there. Default tuning outputs of v0.1.0 are pinned by
+  regression tests.
 - FOPDT identification recovers known K, tau and theta, with and without
   noise.
 - Margins against hand-derived values (integrator with delay, third-order
@@ -383,6 +439,21 @@ and the metrics table is filled.
   is no modelled computation delay beyond the zero-order hold.
 - SIMC is implemented for PI only. The step-test methods need a
   self-regulating plant and refuse the integrating one.
+- Relay autotune is only meaningful on plants whose own phase reaches
+  -180 deg (dead time, or three or more lags). On the motor,
+  mass-spring-damper, integrating axis and arm the validity check fails and
+  the gains are flagged as untrustworthy, but they are still computed and
+  applied so they can be inspected. Version 0.1.0 warned only on the motor.
+- The validity check's thresholds (25 % period change for one extra sample,
+  10 samples per period, 5 % amplitude spread, 10 % asymmetry) are
+  engineering judgement, chosen from the wide gap between passing and
+  failing plants. They are not taken from a standard. The check doubles the
+  relay test time.
+- The describing-function Ku stays the default so that results match
+  v0.1.0. It is 18 % low on the default FOPDT plant; the output notes this
+  whenever it differs from the first-harmonic estimate by more than 5 %.
+  Neither estimate corrects the period, which the relay's own phase error
+  and the sampling delay shift by a few percent.
 - The live view and the step test are separate runs: the live view reacts to
   buttons, the metrics always come from the fixed scenario.
 

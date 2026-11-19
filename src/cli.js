@@ -10,7 +10,7 @@ import { idealGains, parallelGains, pidSettings } from "./core/pid.js";
 /** @typedef {import("./core/lab.js").LabSettings} LabSettings */
 /** @typedef {import("./core/lab.js").Evaluation} Evaluation */
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.1";
 
 /**
  * Everything the CLI touches outside itself, so tests can run it in memory.

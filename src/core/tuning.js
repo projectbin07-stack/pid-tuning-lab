@@ -41,6 +41,14 @@ import { Simulation } from "./sim.js";
  * @property {number} hysteresis eps
  * @property {number} periods number of full periods used
  * @property {boolean} converged false if the period was still changing at maxTime
+ * @property {number} kuHarmonic 1 / |G| at the oscillation frequency, from the first
+ *   Fourier components of the measured output and of the relay output
+ * @property {number} phaseDeg phase of G at the oscillation frequency from the same
+ *   components (-180 deg for an ideal relay and a sinusoidal output)
+ * @property {number} periodSpread (max - min) / mean of the periods used
+ * @property {number} amplitudeSpread (max - min) / mean of the per-cycle amplitudes
+ * @property {number} asymmetry largest |2 t_high / P - 1| over the cycles used
+ *   (0 = equal time at +d and -d)
  * @property {Trace} trace
  */
 
@@ -255,31 +263,51 @@ export function nelderMead(f, x0, scale, iterations) {
  * limit cycle's period approximates the ultimate period and, by the
  * describing function of the relay, its amplitude a gives the ultimate gain
  * Ku = 4 d / (pi sqrt(a^2 - eps^2)).
- * The plant starts at rest at config.r0, which is used as the setpoint.
+ *
+ * Besides that describing-function estimate, the result carries the ratio of
+ * the first Fourier components of the measured output and of the relay output
+ * over the periods used. For a linear plant this ratio is the plant's
+ * frequency response at the oscillation frequency, without assuming that the
+ * output is sinusoidal, so `kuHarmonic` = 1 / |G| there. It also reports how
+ * regular the cycle was (period and amplitude spread, high/low asymmetry),
+ * which `relayValidity` uses.
+ *
+ * `extraDelay` makes the relay act on the measurement taken that many
+ * controller samples earlier: a known delay on the controller side, used by
+ * the validity test. The plant starts at rest at config.r0, which is used as
+ * the setpoint.
  * @param {SimConfig} config
- * @param {{amplitude: number, hysteresis?: number, maxTime: number, periods?: number}} opts
+ * @param {{amplitude: number, hysteresis?: number, maxTime: number, periods?: number, extraDelay?: number}} opts
  * @returns {RelayResult}
  */
 export function relayExperiment(config, opts) {
   const eps = opts.hysteresis ?? 0;
   const d = opts.amplitude;
   const wanted = opts.periods ?? 4;
+  const extra = Math.max(0, Math.round(opts.extraDelay ?? 0));
   if (!(d > 0)) throw new RangeError("relay amplitude must be positive");
   const probe = new Simulation({ ...config, feedForward: 0 });
   const u0 = probe.u;
   let high = true;
   /** @type {number[]} */
   const rises = [];
+  /** @type {number[]} */
+  const falls = [];
+  /** @type {number[]} measurements of the last extra + 1 samples */
+  const past = [];
   const sim = new Simulation({
     ...config,
     feedForward: 0,
     controlLaw: (r, ym, t) => {
-      const e = r - ym;
+      past.push(ym);
+      if (past.length > extra + 1) past.shift();
+      const e = r - past[0];
       if (!high && e > eps) {
         high = true;
         rises.push(t);
       } else if (high && e < -eps) {
         high = false;
+        falls.push(t);
       }
       return high ? u0 + d : u0 - d;
     },
@@ -317,17 +345,52 @@ export function relayExperiment(config, opts) {
     );
   }
   const used = rises.slice(rises.length - wanted - 1);
-  const pu = (used[used.length - 1] - used[0]) / wanted;
+  const t0 = used[0];
+  const t1 = used[used.length - 1];
+  const pu = (t1 - t0) / wanted;
+  const w = (2 * Math.PI) / pu;
   let lo = Infinity;
   let hi = -Infinity;
+  // Per-cycle extremes, and the first Fourier components of ym and u over
+  // exactly `wanted` periods (rectangle rule on the plant interval; u is
+  // piecewise constant on it, and the constant offsets drop out).
+  const cycleLo = new Array(wanted).fill(Infinity);
+  const cycleHi = new Array(wanted).fill(-Infinity);
+  let yRe = 0;
+  let yIm = 0;
+  let uRe = 0;
+  let uIm = 0;
   for (let k = 0; k < trace.t.length; k++) {
-    if (trace.t[k] >= used[0]) {
-      lo = Math.min(lo, trace.ym[k]);
-      hi = Math.max(hi, trace.ym[k]);
-    }
+    const tk = trace.t[k];
+    if (tk < t0 - 1e-12) continue;
+    lo = Math.min(lo, trace.ym[k]);
+    hi = Math.max(hi, trace.ym[k]);
+    if (tk >= t1 - 1e-12) continue;
+    const i = Math.min(wanted - 1, Math.floor((tk - t0) / pu));
+    cycleLo[i] = Math.min(cycleLo[i], trace.ym[k]);
+    cycleHi[i] = Math.max(cycleHi[i], trace.ym[k]);
+    const cs = Math.cos(w * (tk - t0));
+    const sn = Math.sin(w * (tk - t0));
+    yRe += trace.ym[k] * cs;
+    yIm -= trace.ym[k] * sn;
+    uRe += trace.u[k] * cs;
+    uIm -= trace.u[k] * sn;
   }
   const a = (hi - lo) / 2;
   const ku = (4 * d) / (Math.PI * Math.sqrt(Math.max(a * a - eps * eps, 1e-300)));
+  const den = uRe * uRe + uIm * uIm;
+  const gRe = (yRe * uRe + yIm * uIm) / den;
+  const gIm = (yIm * uRe - yRe * uIm) / den;
+  const amps = cycleHi.map((v, i) => (v - cycleLo[i]) / 2);
+  const ampMean = amps.reduce((x, y) => x + y, 0) / wanted;
+  const cyclePeriods = used.slice(1).map((v, i) => v - used[i]);
+  // Time at +d in each cycle: from its rise to the next fall.
+  let asymmetry = 0;
+  for (let i = 0; i < wanted; i++) {
+    const fall = falls.find((f) => f > used[i]);
+    const tHigh = fall === undefined || fall > used[i + 1] ? cyclePeriods[i] : fall - used[i];
+    asymmetry = Math.max(asymmetry, Math.abs((2 * tHigh) / cyclePeriods[i] - 1));
+  }
   return {
     ku,
     pu,
@@ -336,7 +399,121 @@ export function relayExperiment(config, opts) {
     hysteresis: eps,
     periods: wanted,
     converged,
+    kuHarmonic: 1 / Math.hypot(gRe, gIm),
+    phaseDeg: (Math.atan2(gIm, gRe) * 180) / Math.PI,
+    periodSpread: (Math.max(...cyclePeriods) - Math.min(...cyclePeriods)) / pu,
+    amplitudeSpread: (Math.max(...amps) - Math.min(...amps)) / ampMean,
+    asymmetry,
     trace,
+  };
+}
+
+/**
+ * Limits of the relay validity test (see docs/models.md, "Is the relay
+ * result meaningful?").
+ */
+export const RELAY_LIMITS = Object.freeze({
+  /** fewest controller samples per oscillation period */
+  minSamplesPerPeriod: 10,
+  /** largest relative lengthening of the period caused by one extra sample of delay */
+  maxDelaySensitivity: 0.25,
+  /** largest (max - min) / mean of the per-cycle amplitudes */
+  maxAmplitudeSpread: 0.05,
+  /** largest |2 t_high / P - 1| */
+  maxAsymmetry: 0.1,
+});
+
+/**
+ * @typedef {object} RelayValidity
+ * @property {boolean} valid every criterion passed
+ * @property {number} sampleTime controller sample time actually used (s)
+ * @property {number} samplesPerPeriod Pu / sample time
+ * @property {number} puDelayed period with one extra controller sample of delay (s)
+ * @property {number} delaySensitivity (puDelayed - Pu) / Pu
+ * @property {boolean} timingDominated the samples-per-period or delay-sensitivity criterion failed
+ * @property {boolean} irregular the cycle had not settled, or its amplitude or symmetry varied
+ * @property {string[]} failures one sentence fragment per failed criterion
+ */
+
+/**
+ * Decide whether a relay experiment identified a property of the plant
+ * rather than of the controller's timing. The test repeats the experiment
+ * with the relay acting on a measurement one controller sample older, and
+ * checks:
+ *
+ * 1. Delay sensitivity. If the limit cycle is set by the plant's own phase
+ *    lag, one extra sample of delay changes the period only by roughly
+ *    T / D, where D = -d(arg L)/dw is the loop's phase slope at the
+ *    oscillation; if the loop delay (sample, hold and that extra sample)
+ *    is what brings the phase to -180 deg, the period scales with it. The
+ *    relative change must stay at or below `maxDelaySensitivity`.
+ * 2. Samples per period. Below `minSamplesPerPeriod` the period is resolved
+ *    to worse than 10 % and the ZN derivative time Pu/8 is about one sample.
+ * 3. A steady, symmetric cycle: the period had converged (the last periods
+ *    agree within 0.5 %), the per-cycle amplitude varies by at most
+ *    `maxAmplitudeSpread` and the relay spends nearly equal time at +d and -d.
+ *
+ * @param {SimConfig} config the configuration the experiment ran on
+ * @param {{amplitude: number, hysteresis?: number, maxTime: number, periods?: number}} opts
+ *   the experiment's options
+ * @param {RelayResult} res the experiment's result
+ * @returns {RelayValidity}
+ */
+export function relayValidity(config, opts, res) {
+  const T = Math.max(1, Math.round(config.pid.sampleTime / config.dt)) * config.dt;
+  let puDelayed = Infinity;
+  try {
+    puDelayed = relayExperiment(config, { ...opts, extraDelay: 1 }).pu;
+  } catch {
+    // No sustained oscillation with one more sample of delay: the cycle
+    // depended entirely on the timing.
+  }
+  const samplesPerPeriod = res.pu / T;
+  const delaySensitivity = (puDelayed - res.pu) / res.pu;
+  const L = RELAY_LIMITS;
+  /** @type {string[]} */
+  const failures = [];
+  /** @param {number} x */
+  const pct = (x) => `${(100 * x).toFixed(1)} %`;
+  if (samplesPerPeriod < L.minSamplesPerPeriod) {
+    failures.push(
+      `the period is only ${samplesPerPeriod.toFixed(1)} controller samples (at least ${L.minSamplesPerPeriod} needed)`,
+    );
+  }
+  if (!(Math.abs(delaySensitivity) <= L.maxDelaySensitivity)) {
+    failures.push(
+      Number.isFinite(delaySensitivity)
+        ? `one extra sample of loop delay changed the period by ${pct(Math.abs(delaySensitivity))} (at most ${pct(L.maxDelaySensitivity)} allowed)`
+        : "with one extra sample of loop delay there was no sustained oscillation",
+    );
+  }
+  const timingDominated = failures.length > 0;
+  const irregular =
+    !res.converged || res.amplitudeSpread > L.maxAmplitudeSpread || res.asymmetry > L.maxAsymmetry;
+  if (!res.converged) {
+    failures.push(
+      `the period had not settled (spread ${pct(res.periodSpread)} over the last ${res.periods} cycles)`,
+    );
+  }
+  if (res.amplitudeSpread > L.maxAmplitudeSpread) {
+    failures.push(
+      `the amplitude varied by ${pct(res.amplitudeSpread)} between cycles (at most ${pct(L.maxAmplitudeSpread)} allowed)`,
+    );
+  }
+  if (res.asymmetry > L.maxAsymmetry) {
+    failures.push(
+      `the relay spent unequal times high and low (asymmetry ${pct(res.asymmetry)}, at most ${pct(L.maxAsymmetry)} allowed)`,
+    );
+  }
+  return {
+    valid: failures.length === 0,
+    sampleTime: T,
+    samplesPerPeriod,
+    puDelayed,
+    delaySensitivity,
+    timingDominated,
+    irregular,
+    failures,
   };
 }
 

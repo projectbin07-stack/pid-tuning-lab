@@ -11,6 +11,7 @@ import {
   identifyLeastSquares,
   identifyTwoPoint,
   relayExperiment,
+  relayValidity,
   simc,
   stepExperiment,
   tyreusLuyben,
@@ -209,11 +210,36 @@ export function evaluate(s) {
  * @property {ControllerType} type
  * @property {Fopdt | null} model identified FOPDT model (step-based methods)
  * @property {Fopdt | null} modelTwoPoint two-point estimate, for comparison
- * @property {{ku: number, pu: number, amplitude: number} | null} relay relay results (relay methods)
+ * @property {RelaySummary | null} relay relay results (relay methods)
  * @property {Gains} gains
  * @property {LabSettings} settings the input settings with the new gains
  * @property {string[]} warnings reasons to distrust the result
+ * @property {string[]} notes known accuracy limits of a result that passed its checks
+ *
+ * @typedef {"describing-function" | "harmonic"} KuEstimate
+ *
+ * @typedef {object} RelayCheck
+ * @property {boolean} valid
+ * @property {number} samplesPerPeriod
+ * @property {number} delaySensitivity
+ * @property {number} puDelayed
+ * @property {boolean} converged
+ * @property {number} amplitudeSpread
+ * @property {number} asymmetry
+ * @property {string[]} failures
+ *
+ * @typedef {object} RelaySummary
+ * @property {number} ku the ultimate gain the rule used
+ * @property {number} pu ultimate period estimate (s)
+ * @property {number} amplitude output oscillation amplitude
+ * @property {KuEstimate} kuEstimate which estimate `ku` is
+ * @property {number} kuDescribingFunction 4 d / (pi sqrt(a^2 - eps^2))
+ * @property {number} kuHarmonic 1 / |G| from the first Fourier components
+ * @property {RelayCheck} validity the relay validity test (see relayValidity in tuning.js)
  */
+
+/** @type {KuEstimate[]} */
+export const KU_ESTIMATES = ["describing-function", "harmonic"];
 
 /**
  * Run the experiment a tuning method needs on the simulated plant and
@@ -221,9 +247,15 @@ export function evaluate(s) {
  * @param {LabSettings} s
  * @param {string} method one of TUNING_METHODS
  * @param {ControllerType} [type]
+ * @param {{kuEstimate?: KuEstimate}} [options] relay methods: which Ku estimate the rule
+ *   uses (default: the classic describing function)
  * @returns {TuneResult}
  */
-export function autotune(s, method, type = "pid") {
+export function autotune(s, method, type = "pid", options = {}) {
+  const kuEstimate = options.kuEstimate ?? "describing-function";
+  if (!KU_ESTIMATES.includes(kuEstimate)) {
+    throw new RangeError(`Ku estimate must be one of ${KU_ESTIMATES.join(", ")}`);
+  }
   const { config, scenario } = makeConfig(s);
   const plant = config.plant;
   const d = plant.defaults;
@@ -233,10 +265,12 @@ export function autotune(s, method, type = "pid") {
   let model = null;
   /** @type {Fopdt | null} */
   let modelTwoPoint = null;
-  /** @type {{ku: number, pu: number, amplitude: number} | null} */
+  /** @type {RelaySummary | null} */
   let relay = null;
   /** @type {string[]} */
   const warnings = [];
+  /** @type {string[]} */
+  const notes = [];
 
   if (method === "zn-relay" || method === "tyreus-luyben") {
     // Oscillate around the target operating point.
@@ -244,32 +278,74 @@ export function autotune(s, method, type = "pid") {
     const room = Math.min(s.uMax - u0, u0 - s.uMin);
     const amplitude = Math.min(0.2 * (s.uMax - s.uMin), room);
     if (!(amplitude > 0)) throw new RangeError("no room for a relay around the operating point");
-    const res = relayExperiment(
-      { ...config, r0: scenario.r1 },
-      {
-        amplitude,
-        hysteresis: 3 * s.noiseStd + s.quantStep,
-        maxTime: 20 * d.duration,
+    const relayConfig = { ...config, r0: scenario.r1 };
+    const relayOpts = {
+      amplitude,
+      hysteresis: 3 * s.noiseStd + s.quantStep,
+      maxTime: 20 * d.duration,
+    };
+    const res = relayExperiment(relayConfig, relayOpts);
+    const validity = relayValidity(relayConfig, relayOpts, res);
+    const ku = kuEstimate === "harmonic" ? res.kuHarmonic : res.ku;
+    relay = {
+      ku,
+      pu: res.pu,
+      amplitude: res.amplitude,
+      kuEstimate,
+      kuDescribingFunction: res.ku,
+      kuHarmonic: res.kuHarmonic,
+      validity: {
+        valid: validity.valid,
+        samplesPerPeriod: validity.samplesPerPeriod,
+        delaySensitivity: validity.delaySensitivity,
+        puDelayed: validity.puDelayed,
+        converged: res.converged,
+        amplitudeSpread: res.amplitudeSpread,
+        asymmetry: res.asymmetry,
+        failures: validity.failures,
       },
-    );
-    relay = { ku: res.ku, pu: res.pu, amplitude: res.amplitude };
-    if (!res.converged) {
+    };
+    const rule = method === "zn-relay" ? "Ziegler-Nichols" : "Tyreus-Luyben";
+    if (!validity.valid) {
+      const causes = [];
+      if (validity.timingDominated) {
+        causes.push(
+          "the oscillation is set by the controller's sampling and loop delay rather than by the plant's own phase lag",
+        );
+      }
+      if (validity.irregular) causes.push("the limit cycle was not steady and symmetric");
+      const cause = causes.join(", and ");
       warnings.push(
-        "The relay oscillation had not settled to a steady period when the test ended.",
+        `The relay test failed its validity check: ${validity.failures.join("; ")}. ` +
+          `${cause[0].toUpperCase()}${cause.slice(1)}, so Ku, Pu and the ${rule} gains derived ` +
+          "from them are not trustworthy" +
+          (validity.timingDominated
+            ? ": they follow the sample time, not the plant, and are usually too aggressive. "
+            : ". ") +
+          (plant.selfRegulating
+            ? "Use a step-test method (SIMC or Cohen-Coon) instead; it warns separately if the FOPDT fit is poor."
+            : "The step-test methods (SIMC, Cohen-Coon) need a self-regulating plant and do not apply here; " +
+              "start from conservative gains and tune by hand against the phase margin."),
       );
-    }
-    const T = Math.max(1, Math.round(s.sampleTime / config.dt)) * config.dt;
-    if (res.pu < 10 * T) {
-      warnings.push(
-        `The relay oscillation period (${res.pu.toPrecision(3)} s) is under 10 controller samples. ` +
-          "The plant has too little phase lag for a relay test, so the oscillation is set by the " +
-          "sampling delay and the gains derived from it are likely to be too aggressive.",
-      );
+    } else {
+      const diff = (res.kuHarmonic - res.ku) / res.kuHarmonic;
+      if (Math.abs(diff) > 0.05) {
+        notes.push(
+          `The describing-function Ku (${res.ku.toPrecision(4)}) is ${(100 * Math.abs(diff)).toFixed(0)} % ` +
+            `${diff > 0 ? "below" : "above"} the first-harmonic estimate (${res.kuHarmonic.toPrecision(4)}). ` +
+            "The relay output here is far from sinusoidal, which the describing function assumes, so expect " +
+            "the classic Ku to be off by about that much; the first-harmonic estimate measures the plant's " +
+            "gain at the oscillation frequency without that assumption. " +
+            (kuEstimate === "harmonic"
+              ? "The gains use the first-harmonic estimate."
+              : "The gains use the describing-function value; choose the first-harmonic estimate to use the other."),
+        );
+      }
     }
     gains =
       method === "zn-relay"
-        ? zieglerNicholsUltimate(res.ku, res.pu, type)
-        : tyreusLuyben(res.ku, res.pu, type);
+        ? zieglerNicholsUltimate(ku, res.pu, type)
+        : tyreusLuyben(ku, res.pu, type);
   } else if (method === "simc" || method === "cohen-coon" || method === "zn-step") {
     if (!plant.selfRegulating) {
       throw new RangeError(
@@ -328,5 +404,6 @@ export function autotune(s, method, type = "pid") {
     gains,
     settings,
     warnings,
+    notes,
   };
 }

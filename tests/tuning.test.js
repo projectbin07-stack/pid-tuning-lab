@@ -7,7 +7,9 @@ import {
   identifyLeastSquares,
   identifyTwoPoint,
   nelderMead,
+  RELAY_LIMITS,
   relayExperiment,
+  relayValidity,
   simc,
   stepExperiment,
   tyreusLuyben,
@@ -216,15 +218,11 @@ test("step-based methods refuse an integrating plant", () => {
 });
 
 test("autotune warns when the experiment does not fit the rule's assumptions", () => {
-  const motorRelay = autotune(defaultSettings("motor"), "zn-relay");
-  assert.ok(motorRelay.warnings.some((w) => /10 controller samples/.test(w)));
   const msdStep = autotune(defaultSettings("msd"), "simc");
   assert.ok(msdStep.warnings.some((w) => /fits the step response poorly/.test(w)));
   // Open loop, the holding torque for 90 degrees flips the arm over the top.
   const armStep = autotune(defaultSettings("arm"), "cohen-coon");
   assert.ok(armStep.warnings.some((w) => /still moving/.test(w)));
-  const armRelay = autotune(defaultSettings("arm"), "zn-relay");
-  assert.ok(armRelay.warnings.some((w) => /had not settled/.test(w)));
   const motorStep = autotune(defaultSettings("motor"), "zn-step");
   assert.ok(motorStep.warnings.some((w) => /theta\/tau/.test(w)));
 });
@@ -232,4 +230,196 @@ test("autotune warns when the experiment does not fit the rule's assumptions", (
 test("relay autotune needs room around the operating point", () => {
   const s = { ...defaultSettings("thermal"), r1: 25 }; // needs u = 0, at the lower limit
   assert.throws(() => autotune(s, "zn-relay"), /no room/);
+});
+
+// --- Relay validity test -------------------------------------------------
+
+/**
+ * @param {string} plant
+ * @param {number} [sampleTime]
+ * @param {string} [method]
+ */
+function relayTune(plant, sampleTime, method = "zn-relay") {
+  const s = defaultSettings(plant);
+  if (sampleTime !== undefined) s.sampleTime = sampleTime;
+  const res = autotune(s, method);
+  assert.ok(res.relay);
+  return { res, relay: res.relay, v: res.relay.validity };
+}
+
+test("relay validity passes on the hotend and FOPDT plants at default settings", () => {
+  for (const plant of ["thermal", "fopdt"]) {
+    for (const method of ["zn-relay", "tyreus-luyben"]) {
+      const { res, v } = relayTune(plant, undefined, method);
+      assert.equal(v.valid, true, `${plant} ${method}: ${v.failures.join("; ")}`);
+      assert.deepEqual(v.failures, []);
+      assert.deepEqual(res.warnings, []);
+      assert.ok(v.samplesPerPeriod >= 10);
+      assert.ok(v.delaySensitivity < 0.1, `${plant}: ${v.delaySensitivity}`);
+      assert.ok(v.converged);
+    }
+  }
+});
+
+test("relay validity fails on motor, mass-spring-damper, integrating axis and arm", () => {
+  // None of these models reaches -180 deg of phase on its own (at most two
+  // lags, no dead time), so the limit cycle needs the controller's delay.
+  for (const plant of ["motor", "msd", "integrating", "arm"]) {
+    const { res, relay, v } = relayTune(plant);
+    assert.equal(v.valid, false, plant);
+    // The general criterion catches every one of them: one sample of extra
+    // delay changes the period by far more than 25 %.
+    assert.ok(v.delaySensitivity > 0.5, `${plant}: ${v.delaySensitivity}`);
+    assert.ok(
+      v.failures.some((f) => /one extra sample of loop delay/.test(f)),
+      plant,
+    );
+    assert.equal(res.warnings.length, 1, plant);
+    assert.match(res.warnings[0], /failed its validity check/);
+    assert.match(res.warnings[0], /sampling and loop delay rather than by the plant/);
+    assert.match(res.warnings[0], /not trustworthy/);
+    assert.match(
+      res.warnings[0],
+      plant === "integrating"
+        ? /do not apply here/
+        : /Use a step-test method \(SIMC or Cohen-Coon\)/,
+    );
+    assert.deepEqual(res.notes, [], plant);
+    assert.ok(relay.ku > 0);
+  }
+  // Motor: the period is 4 samples, which the samples criterion also flags.
+  assert.ok(relayTune("motor").v.failures.some((f) => /only 4\.0 controller samples/.test(f)));
+  // Arm: nonlinear, the cycle also had not settled.
+  const arm = relayTune("arm");
+  assert.equal(arm.v.converged, false);
+  assert.match(arm.res.warnings[0], /not steady and symmetric/);
+});
+
+test("the relay validity result moves with the sample time in the expected direction", () => {
+  // FOPDT: a longer sample time is a larger share of the loop's delay, so
+  // one more sample moves the period more; at 0.3 s (30 % of the dead time)
+  // the test fails.
+  const sens = [0.03, 0.05, 0.2].map((ts) => relayTune("fopdt", ts).v.delaySensitivity);
+  assert.ok(sens[0] < sens[1] && sens[1] < sens[2], sens.join(", "));
+  const slow = relayTune("fopdt", 0.3);
+  assert.equal(slow.v.valid, false);
+  assert.ok(slow.v.delaySensitivity > 0.25);
+  assert.ok(
+    relayTune("thermal", 0.05).v.delaySensitivity < relayTune("thermal", 0.4).v.delaySensitivity,
+  );
+  assert.equal(relayTune("thermal", 1).v.valid, false);
+  // Motor: the period is set by the sampling, so it scales with the sample
+  // time and a faster controller does not make the test valid.
+  const fast = relayTune("motor", 0.0005);
+  const slowMotor = relayTune("motor", 0.002);
+  nearRel(slowMotor.relay.pu / fast.relay.pu, 4, 1e-9, "Pu ratio");
+  assert.equal(fast.v.valid, false);
+  assert.equal(slowMotor.v.valid, false);
+  // Mass-spring-damper with a five times faster controller: still invalid.
+  assert.equal(relayTune("msd", 0.002).v.valid, false);
+});
+
+test("relayValidity on 1/(s+1)^3 passes and reports a small delay sensitivity", () => {
+  const opts = { amplitude: 1, maxTime: 200 };
+  const res = relayExperiment(lag3Config(), opts);
+  const v = relayValidity(lag3Config(), opts, res);
+  assert.equal(v.valid, true, v.failures.join("; "));
+  // Phase slope of 3 lags at sqrt 3 rad/s is 3/(1 + 3) = 0.75 s, so one
+  // 2 ms sample should move the period by about 0.002 / 0.75 = 0.3 %.
+  assert.ok(v.delaySensitivity > 0 && v.delaySensitivity < 0.01, String(v.delaySensitivity));
+  assert.equal(v.timingDominated, false);
+  assert.equal(v.irregular, false);
+  assert.equal(RELAY_LIMITS.maxDelaySensitivity, 0.25);
+});
+
+test("relayValidity flags irregular cycles and a missing delayed oscillation", () => {
+  const opts = { amplitude: 1, maxTime: 200 };
+  const res = relayExperiment(lag3Config(), opts);
+  const bad = relayValidity(lag3Config(), opts, {
+    ...res,
+    converged: false,
+    amplitudeSpread: 0.2,
+    asymmetry: 0.3,
+  });
+  assert.equal(bad.valid, false);
+  assert.equal(bad.timingDominated, false);
+  assert.equal(bad.irregular, true);
+  assert.equal(bad.failures.length, 3);
+  assert.match(bad.failures.join("; "), /had not settled.*amplitude varied.*unequal times/);
+  // maxTime too short for the delayed run to oscillate.
+  const none = relayValidity(lag3Config(), { amplitude: 1, maxTime: 2 }, res);
+  assert.equal(none.puDelayed, Infinity);
+  assert.match(none.failures.join(";"), /no sustained oscillation/);
+});
+
+test("first-harmonic Ku is the plant's gain at the oscillation frequency", () => {
+  // 1/(s+1)^3: |G(jw)| = (1 + w^2)^-1.5 exactly; the describing function is
+  // a few percent off, the first harmonic should be within 0.5 %.
+  const res = relayExperiment(lag3Config(), { amplitude: 1, maxTime: 200 });
+  const w = (2 * Math.PI) / res.pu;
+  nearRel(res.kuHarmonic, (1 + w * w) ** 1.5, 0.005, "lag3 first-harmonic Ku");
+  const expected = (-3 * Math.atan(w) * 180) / Math.PI;
+  near(((res.phaseDeg - expected + 540) % 360) - 180, 0, 0.5, "phase of G at the oscillation");
+  // FOPDT K = 2, tau = 5, theta = 1 with a 10 ms controller (nearly a
+  // continuous relay). Hand-derived for an ideal relay, see docs/models.md:
+  // a = K d (1 - e^(-theta/tau)), so the describing function gives
+  // Ku = 4 / (pi K (1 - e^-0.2)) = 3.512, and Pu = 2 theta + 2 tau ln(2 - e^-0.2) = 3.666 s,
+  // while 1 / |G| at that frequency is about 4.30: the describing function
+  // is 18 % low and the first harmonic is not.
+  const { relay } = relayTune("fopdt", 0.01);
+  nearRel(relay.kuDescribingFunction, 4 / (Math.PI * 2 * (1 - Math.exp(-0.2))), 0.01, "DF Ku");
+  nearRel(relay.pu, 2 + 10 * Math.log(2 - Math.exp(-0.2)), 0.01, "Pu");
+  const wf = (2 * Math.PI) / relay.pu;
+  nearRel(relay.kuHarmonic, Math.hypot(1, 5 * wf) / 2, 0.002, "first-harmonic Ku");
+});
+
+test("relay notes state the describing-function error, and the harmonic option uses the other Ku", () => {
+  const df = autotune(defaultSettings("fopdt"), "zn-relay");
+  assert.ok(df.relay);
+  assert.equal(df.relay.kuEstimate, "describing-function");
+  assert.equal(df.notes.length, 1);
+  assert.match(df.notes[0], /is 19 % below the first-harmonic estimate/);
+  const h = autotune(defaultSettings("fopdt"), "zn-relay", "pid", { kuEstimate: "harmonic" });
+  assert.ok(h.relay);
+  assert.equal(h.relay.ku, h.relay.kuHarmonic);
+  assert.match(h.notes[0], /The gains use the first-harmonic estimate/);
+  assert.deepEqual(h.gains, zieglerNicholsUltimate(h.relay.kuHarmonic, h.relay.pu));
+  // The hotend's relay output is close to a sinusoid: the estimates agree
+  // within 1 % and no note is attached.
+  const th = autotune(defaultSettings("thermal"), "zn-relay");
+  assert.ok(th.relay);
+  nearRel(th.relay.kuHarmonic, th.relay.kuDescribingFunction, 0.01);
+  assert.deepEqual(th.notes, []);
+  assert.throws(
+    () =>
+      autotune(defaultSettings("fopdt"), "zn-relay", "pid", {
+        kuEstimate: /** @type {any} */ ("exact"),
+      }),
+    /Ku estimate must be one of/,
+  );
+});
+
+test("regression: v0.1.0 tuning outputs are unchanged by default", () => {
+  // Values printed by v0.1.0 (README) for the same commands.
+  const th = autotune(defaultSettings("thermal"), "zn-relay");
+  assert.ok(th.relay);
+  nearRel(th.relay.ku, 0.3151, 2e-4, "thermal Ku");
+  nearRel(th.relay.pu, 11.6, 1e-9, "thermal Pu");
+  nearRel(th.gains.kp, 0.1891, 3e-4, "thermal Kp");
+  nearRel(th.gains.ki, 0.0326, 2e-3, "thermal Ki");
+  nearRel(th.gains.kd, 0.2742, 3e-4, "thermal Kd");
+  assert.deepEqual(th.gains, zieglerNicholsUltimate(th.relay.ku, th.relay.pu));
+  const motor = autotune(defaultSettings("motor"), "zn-relay");
+  assert.ok(motor.relay);
+  nearRel(motor.relay.ku, 4.882, 2e-4, "motor Ku");
+  nearRel(motor.relay.pu, 0.004, 1e-9, "motor Pu");
+  const fopdt = autotune(defaultSettings("fopdt"), "zn-relay");
+  assert.ok(fopdt.relay);
+  nearRel(fopdt.relay.ku, 3.388, 2e-4, "FOPDT Ku");
+  nearRel(fopdt.relay.pu, 3.8, 1e-9, "FOPDT Pu");
+  const s = autotune(defaultSettings("fopdt"), "simc");
+  nearRel(s.gains.kp, 1.225, 5e-4, "SIMC Kp");
+  nearRel(s.gains.ki, 0.2451, 5e-4, "SIMC Ki");
+  assert.equal(s.relay, null);
+  assert.deepEqual(s.notes, []);
 });
